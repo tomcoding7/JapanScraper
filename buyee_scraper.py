@@ -31,6 +31,7 @@ from image_analyzer import ImageAnalyzer
 import glob
 from card_analyzer2 import CardAnalyzer, CardInfo, CardCondition
 from rank_analyzer import RankAnalyzer
+from dataclasses import asdict
 
 # Set up logging with more detailed format
 logging.basicConfig(
@@ -1420,8 +1421,10 @@ class BuyeeScraper:
                     if title_element:
                         card_info['title'] = title_element.text.strip()
                         card_info['url'] = title_element.get_attribute('href')
+                        logger.debug(f"Found title element with selector {selector}: {card_info['title']}")
                         break
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to find title with selector {selector}: {str(e)}")
                     continue
             
             if not card_info['title'] or not card_info['url']:
@@ -1443,14 +1446,16 @@ class BuyeeScraper:
                         price_text = price_element.text.strip()
                         if price_text:
                             card_info['price'] = self.clean_price(price_text)
+                            logger.debug(f"Found price element with selector {selector}: {card_info['price']}")
                             break
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to find price with selector {selector}: {str(e)}")
                     continue
             
             if not card_info['price']:
                 card_info['price'] = 0.0
             
-            # Extract thumbnail URL - prioritize known good selector
+            # Extract thumbnail URL - prioritize known good selector and increase timeout
             thumbnail_selectors = [
                 "div.itemCard__image img",  # Primary selector
                 "img[data-testid='item-card-image']",
@@ -1460,13 +1465,25 @@ class BuyeeScraper:
             
             for selector in thumbnail_selectors:
                 try:
-                    img_element = self.wait_for_element(By.CSS_SELECTOR, selector, timeout=5, parent=card)
+                    # Use a longer timeout for images since they might be lazy-loaded
+                    img_element = self.wait_for_element(
+                        By.CSS_SELECTOR, 
+                        selector, 
+                        timeout=10,  # Increased timeout for images
+                        condition="visibility",  # Wait for visibility since images might be lazy-loaded
+                        parent=card
+                    )
                     if img_element:
-                        thumbnail_url = img_element.get_attribute('data-src') or img_element.get_attribute('src')
+                        # Try data-src first (common for lazy-loaded images)
+                        thumbnail_url = img_element.get_attribute('data-src')
+                        if not thumbnail_url:
+                            thumbnail_url = img_element.get_attribute('src')
                         if thumbnail_url:
                             card_info['thumbnail_url'] = thumbnail_url
+                            logger.debug(f"Found thumbnail with selector {selector}: {thumbnail_url}")
                             break
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to find thumbnail with selector {selector}: {str(e)}")
                     continue
             
             # Only attempt AI analysis if we have the basic info
@@ -1481,13 +1498,37 @@ class BuyeeScraper:
                     }
                     
                     # Call analyze_card with the item_data dictionary
-                    preliminary_analysis = self.card_analyzer.analyze_card(item_data)
+                    preliminary_analysis_result = self.card_analyzer.analyze_card(item_data)
                     
-                    if preliminary_analysis:
-                        card_info['preliminary_analysis'].update(preliminary_analysis)
-                        logger.info(f"Successfully analyzed card: {card_info['title']}")
+                    if preliminary_analysis_result:
+                        try:
+                            # Handle CardInfo object
+                            if hasattr(preliminary_analysis_result, '__dict__'):
+                                # Convert CardInfo object to dictionary
+                                analysis_dict = asdict(preliminary_analysis_result) if hasattr(preliminary_analysis_result, '__dataclass_fields__') else preliminary_analysis_result.__dict__
+                                
+                                # Handle any enum values
+                                if 'condition' in analysis_dict and hasattr(analysis_dict['condition'], 'value'):
+                                    analysis_dict['condition'] = analysis_dict['condition'].value
+                                
+                                card_info['preliminary_analysis'].update(analysis_dict)
+                                logger.info(f"Successfully analyzed card: {card_info['title']}")
+                            # Handle dictionary result
+                            elif isinstance(preliminary_analysis_result, dict):
+                                card_info['preliminary_analysis'].update(preliminary_analysis_result)
+                                logger.info(f"Successfully analyzed card: {card_info['title']}")
+                            else:
+                                error_msg = f"Unexpected analysis result type: {type(preliminary_analysis_result)}"
+                                logger.error(f"{error_msg} for card: {card_info['title']}")
+                                card_info['preliminary_analysis']['error'] = error_msg
+                                
+                        except Exception as analysis_error:
+                            error_msg = f"Error processing analysis result: {str(analysis_error)}"
+                            logger.error(f"{error_msg} for card: {card_info['title']}")
+                            card_info['preliminary_analysis']['error'] = error_msg
                     else:
                         logger.warning(f"Card analysis returned None for: {card_info['title']}")
+                        card_info['preliminary_analysis']['error'] = "AI analysis returned None"
                         
                 except Exception as e:
                     error_msg = f"AI analysis failed: {str(e)}"
