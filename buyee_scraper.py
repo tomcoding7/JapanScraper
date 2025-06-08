@@ -29,13 +29,14 @@ import argparse
 import statistics
 from image_analyzer import ImageAnalyzer
 import glob
-from card_analyzer2 import CardAnalyzer, CardInfo, CardCondition
+from card_analyzer import CardAnalyzer, CardInfo, CardCondition
 from rank_analyzer import RankAnalyzer
 from dataclasses import asdict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Set up logging with more detailed format
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG for more detailed logging
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.FileHandler('scraper.log'),
@@ -71,6 +72,9 @@ class BuyeeScraper:
         self.card_analyzer = CardAnalyzer()
         self.rank_analyzer = RankAnalyzer()
         
+        # Load selectors from JSON file
+        self.selectors = self._load_selectors()
+        
         # Session management
         self.session_retry_count = 0
         self.max_session_retries = 3
@@ -83,110 +87,299 @@ class BuyeeScraper:
         
         # Create output directory
         os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'debug'), exist_ok=True)
         
         # Initialize driver
         if not self.setup_driver():
             raise Exception("Failed to initialize WebDriver")
-        
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-        
-    def cleanup(self):
-        """Clean up resources and close the driver."""
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception as e:
-                logger.error(f"Error during driver cleanup: {str(e)}")
-            self.driver = None
-            
-    def setup_driver(self):
-        """Set up and return a configured Chrome WebDriver instance."""
+
+    def _load_selectors(self) -> Dict[str, Any]:
+        """Load CSS selectors from the JSON configuration file."""
         try:
-            chrome_options = Options()
+            with open('selectors.json', 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load selectors.json: {str(e)}")
+            raise
+
+    def save_debug_info(self, identifier: str, error_type: str, page_source: str) -> None:
+        """Save debug information about a failed request."""
+        try:
+            # Sanitize the identifier for use in filenames
+            safe_identifier = self.sanitize_filename(identifier)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # Basic options for stability
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--disable-extensions')
-            chrome_options.add_argument('--disable-popup-blocking')
-            chrome_options.add_argument('--disable-notifications')
-            chrome_options.add_argument('--disable-infobars')
-            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            # Create debug directory if it doesn't exist
+            debug_dir = os.path.join(self.output_dir, 'debug')
+            os.makedirs(debug_dir, exist_ok=True)
             
-            # Memory and performance options
-            chrome_options.add_argument('--disable-application-cache')
-            chrome_options.add_argument('--disable-background-networking')
-            chrome_options.add_argument('--disable-background-timer-throttling')
-            chrome_options.add_argument('--disable-backgrounding-occluded-windows')
-            chrome_options.add_argument('--disable-breakpad')
-            chrome_options.add_argument('--disable-client-side-phishing-detection')
-            chrome_options.add_argument('--disable-default-apps')
-            chrome_options.add_argument('--disable-domain-reliability')
-            chrome_options.add_argument('--disable-features=AudioServiceOutOfProcess')
-            chrome_options.add_argument('--disable-hang-monitor')
-            chrome_options.add_argument('--disable-ipc-flooding-protection')
-            chrome_options.add_argument('--disable-prompt-on-repost')
-            chrome_options.add_argument('--disable-renderer-backgrounding')
-            chrome_options.add_argument('--disable-sync')
-            chrome_options.add_argument('--force-color-profile=srgb')
-            chrome_options.add_argument('--metrics-recording-only')
-            chrome_options.add_argument('--no-first-run')
-            chrome_options.add_argument('--password-store=basic')
-            chrome_options.add_argument('--use-mock-keychain')
-            chrome_options.add_argument('--disable-features=site-per-process')
+            # Save HTML source
+            html_path = os.path.join(debug_dir, f"{safe_identifier}_{timestamp}.html")
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(page_source)
             
-            # SSL/TLS related options
-            chrome_options.add_argument('--ignore-certificate-errors')
-            chrome_options.add_argument('--allow-insecure-localhost')
-            chrome_options.add_argument('--reduce-security-for-testing')
+            # Take screenshot if driver is available
+            if self.driver:
+                screenshot_path = os.path.join(debug_dir, f"{safe_identifier}_{timestamp}.png")
+                self.driver.save_screenshot(screenshot_path)
             
-            # Window size and user agent
-            chrome_options.add_argument('--window-size=1920,1080')
-            chrome_options.add_argument('--start-maximized')
-            chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            
-            # Additional anti-detection measures
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            
-            # Create the driver with service
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            
-            # Apply stealth settings
-            stealth(self.driver,
-                languages=["en-US", "en"],
-                vendor="Google Inc.",
-                platform="Win32",
-                webgl_vendor="Intel Inc.",
-                renderer="Intel Iris OpenGL Engine",
-                fix_hairline=True,
-            )
-            
-            # Set page load timeout and script timeout
-            self.driver.set_page_load_timeout(30)
-            self.driver.set_script_timeout(30)
-            
-            # Set window size explicitly after creation
-            self.driver.set_window_size(1920, 1080)
-            
-            # Add error handling for common WebDriver issues
-            self.driver.execute_cdp_cmd('Network.setBypassServiceWorker', {'bypass': True})
-            self.driver.execute_cdp_cmd('Network.enable', {})
-            self.driver.execute_cdp_cmd('Network.setCacheDisabled', {'cacheDisabled': True})
-            
-            logger.info("WebDriver initialized successfully with enhanced stability options")
-            return True
+            logger.info(f"Debug info saved: {html_path}")
             
         except Exception as e:
-            logger.error(f"Failed to setup WebDriver: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error saving debug info: {str(e)}")
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((WebDriverException, TimeoutException))
+    )
+    def handle_cookie_consent(self) -> bool:
+        """Handle cookie consent popup with improved reliability."""
+        try:
+            # Wait for cookie banner to be present
+            cookie_banner = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['popups']['cookie_banner'],
+                timeout=10,
+                condition="presence"
+            )
+            
+            if not cookie_banner:
+                logger.debug("No cookie banner found")
+                return True
+            
+            # Wait for accept button to be clickable
+            accept_button = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['popups']['cookie_accept'],
+                timeout=10,
+                condition="clickable",
+                parent=cookie_banner
+            )
+            
+            if not accept_button:
+                logger.warning("Cookie accept button not found")
+                return False
+            
+            # Click the accept button
+            accept_button.click()
+            
+            # Wait for banner to disappear
+            try:
+                WebDriverWait(self.driver, 10).until_not(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, self.selectors['popups']['cookie_banner']))
+                )
+                logger.info("Cookie consent handled successfully")
+                return True
+            except TimeoutException:
+                logger.warning("Cookie banner did not disappear after clicking accept")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error handling cookie consent: {str(e)}")
             return False
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((WebDriverException, TimeoutException))
+    )
+    def get_item_summaries_from_search_page(self, page_number: int = 1) -> List[Dict]:
+        """Get item summaries from the current search page with improved error handling."""
+        try:
+            # Wait for the search results container
+            container = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['container'],
+                timeout=self.element_wait_time
+            )
+            
+            if not container:
+                logger.error("Could not find item list container")
+                self.save_debug_info(
+                    f"page_{page_number}_no_container",
+                    "container_not_found",
+                    self.driver.page_source
+                )
+                return []
+            
+            # Get all item cards
+            item_cards = container.find_elements(By.CSS_SELECTOR, self.selectors['search_results']['item_card'])
+            
+            if not item_cards:
+                logger.warning(f"No items found on page {page_number}")
+                return []
+            
+            items = []
+            for index, card in enumerate(item_cards):
+                try:
+                    if not self.is_element_attached(card):
+                        continue
+                    
+                    item_info = self.extract_card_info(card, index)
+                    if item_info:
+                        items.append(item_info)
+                        
+                except StaleElementReferenceException:
+                    logger.warning(f"Stale element reference for item {index}")
+                    continue
+                except Exception as e:
+                    logger.error(f"Error extracting info for item {index}: {str(e)}")
+                    continue
+            
+            return items
+            
+        except Exception as e:
+            logger.error(f"Error getting item summaries: {str(e)}")
+            self.save_debug_info(
+                f"page_{page_number}_error",
+                "get_summaries_error",
+                self.driver.page_source
+            )
+            return []
+
+    def extract_card_info(self, card: WebElement, index: int) -> Optional[Dict[str, Any]]:
+        """Extract information from a card element with improved error handling."""
+        try:
+            # Extract title
+            title_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['title'],
+                timeout=5,
+                parent=card
+            )
+            title = title_elem.text if title_elem else "Unknown Title"
+            
+            # Extract price
+            price_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['price'],
+                timeout=5,
+                parent=card
+            )
+            price = self.clean_price(price_elem.text) if price_elem else 0.0
+            
+            # Extract image URL
+            img_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['image'],
+                timeout=5,
+                parent=card
+            )
+            image_url = img_elem.get_attribute('src') if img_elem else None
+            
+            # Extract link
+            link_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['link'],
+                timeout=5,
+                parent=card
+            )
+            url = link_elem.get_attribute('href') if link_elem else None
+            
+            # Extract time left
+            time_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['time_left'],
+                timeout=5,
+                parent=card
+            )
+            time_left = time_elem.text if time_elem else "Unknown"
+            
+            # Extract seller
+            seller_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['seller'],
+                timeout=5,
+                parent=card
+            )
+            seller = seller_elem.text if seller_elem else "Unknown"
+            
+            # Extract condition
+            condition_elem = self.wait_for_element(
+                By.CSS_SELECTOR,
+                self.selectors['search_results']['condition'],
+                timeout=5,
+                parent=card
+            )
+            condition = condition_elem.text if condition_elem else "Unknown"
+            
+            return {
+                'title': title,
+                'price': price,
+                'image_url': image_url,
+                'url': url,
+                'time_left': time_left,
+                'seller': seller,
+                'condition': condition,
+                'index': index
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting card info: {str(e)}")
+            return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((WebDriverException, TimeoutException))
+    )
+    def search_items(self, search_term: str) -> List[Dict[str, Any]]:
+        """Search for items with improved error handling and retry mechanism."""
+        try:
+            # Construct search URL
+            search_url = f"{self.base_url}/item/search/query/{quote(search_term)}"
+            
+            # Navigate to search page
+            self.driver.get(search_url)
+            
+            # Handle cookie consent
+            if not self.handle_cookie_consent():
+                logger.warning("Failed to handle cookie consent, but continuing...")
+            
+            # Wait for page to be ready
+            if not self.wait_for_page_ready():
+                logger.error("Page failed to load properly")
+                return []
+            
+            all_items = []
+            current_page = 1
+            
+            while current_page <= self.max_pages:
+                logger.info(f"Scraping page {current_page} for search term: {search_term}")
+                
+                # Get items from current page
+                items = self.get_item_summaries_from_search_page(current_page)
+                
+                if not items:
+                    logger.warning(f"No items found on page {current_page}")
+                    break
+                
+                all_items.extend(items)
+                
+                # Check if there's a next page
+                if not self.has_next_page():
+                    logger.info("No more pages available")
+                    break
+                
+                # Go to next page
+                if not self.go_to_next_page():
+                    logger.warning("Failed to navigate to next page")
+                    break
+                
+                current_page += 1
+                time.sleep(2)  # Add delay between pages
+            
+            return all_items
+            
+        except Exception as e:
+            logger.error(f"Error during search: {str(e)}")
+            self.save_debug_info(
+                f"search_{search_term}_error",
+                "search_error",
+                self.driver.page_source
+            )
+            return []
 
     def sanitize_filename(self, filename: str) -> str:
         """
@@ -215,26 +408,6 @@ class BuyeeScraper:
         except Exception as e:
             logger.error(f"Error sanitizing filename: {str(e)}")
             return f"invalid_filename_{hash(filename)}"
-
-    def save_debug_info(self, identifier: str, error_type: str, page_source: str) -> None:
-        """Save debug information about a failed request."""
-        try:
-            # Sanitize the identifier for use in filenames
-            safe_identifier = self.sanitize_filename(identifier)
-            
-            debug_dir = os.path.join(self.output_dir, "debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{safe_identifier}_{error_type}_{timestamp}.html"
-            filepath = os.path.join(debug_dir, filename)
-            
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(page_source)
-            logger.info(f"Saved debug info to {filepath}")
-            
-        except Exception as e:
-            logger.error(f"Error saving debug info: {str(e)}")
 
     def test_connection(self):
         """Test basic connectivity to Buyee and perform network diagnostics."""
@@ -872,52 +1045,6 @@ class BuyeeScraper:
             logger.warning(f"Failed to navigate to next page: {str(e)}")
             return False
 
-    def handle_cookie_consent(self) -> bool:
-        """Handle cookie consent popup with multiple fallback approaches."""
-        cookie_selectors = [
-            # Primary selectors
-            "div.cookiePolicyPopup__buttonWrapper button.accept_cookie",
-            "button#js-accept-cookies",
-            "button.accept-cookies",
-            "button[data-testid='cookie-accept']",
-            # Fallback selectors
-            "//button[contains(text(), 'Accept')]",
-            "//button[contains(text(), '同意')]",
-            "//button[contains(@class, 'cookie')]",
-            "//div[contains(@class, 'cookie')]//button"
-        ]
-        
-        for selector in cookie_selectors:
-            try:
-                # Try CSS selector first
-                if selector.startswith("//"):
-                    element = self.wait_for_element(By.XPATH, selector, timeout=5, condition="clickable")
-                else:
-                    element = self.wait_for_element(By.CSS_SELECTOR, selector, timeout=5, condition="clickable")
-                
-                if element:
-                    # Try JavaScript click first
-                    try:
-                        self.driver.execute_script("arguments[0].click();", element)
-                        logger.info(f"Clicked cookie consent using JavaScript: {selector}")
-                        return True
-                    except Exception as js_error:
-                        # Fall back to regular click
-                        try:
-                            element.click()
-                            logger.info(f"Clicked cookie consent using regular click: {selector}")
-                            return True
-                        except Exception as click_error:
-                            logger.warning(f"Failed to click cookie consent: {str(click_error)}")
-                            continue
-                            
-            except Exception as e:
-                logger.debug(f"Cookie consent attempt failed with selector {selector}: {str(e)}")
-                continue
-        
-        logger.warning("Could not handle cookie consent popup")
-        return False
-
     def save_initial_promising_links(self, item_summaries: List[Dict[str, Any]], search_term: str) -> None:
         """Save initial promising links to a separate file before detailed analysis."""
         if not item_summaries:
@@ -964,116 +1091,6 @@ class BuyeeScraper:
         except Exception as e:
             logger.error(f"Error saving initial promising links: {str(e)}")
             logger.error(traceback.format_exc())
-
-    def search_items(self, search_term: str) -> List[Dict[str, Any]]:
-        """Search for items and analyze them."""
-        try:
-            logger.info(f"Starting search for: {search_term}")
-            
-            # Check if driver is valid before starting
-            if not self.is_driver_valid():
-                logger.error("WebDriver is not valid and could not be recreated")
-                return []
-            
-            # Construct search URL
-            search_url = f"{self.base_url}/item/search/query/{quote(search_term)}"
-            logger.info(f"Search URL: {search_url}")
-            
-            # Navigate to search page with retry logic
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    self.driver.get(search_url)
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        logger.error(f"Failed to load search page after {max_retries} attempts: {str(e)}")
-                        return []
-                    logger.warning(f"Attempt {attempt + 1} failed, retrying...")
-                    if not self.is_driver_valid():
-                        return []
-                    time.sleep(2)
-            
-            # Handle cookie popup if present
-            self.handle_cookie_consent()
-            
-            # Wait for page to be ready
-            if not self.wait_for_page_ready():
-                logger.error("Page failed to load properly")
-                return []
-            
-            # Initialize results list
-            all_items = []
-            page = 1
-            
-            while page <= self.max_pages:
-                # Check if driver is still valid
-                if not self.is_driver_valid():
-                    logger.error("WebDriver became invalid during search")
-                    break
-                
-                logger.info(f"Processing page {page}")
-                
-                # Get item summaries from current page
-                item_summaries = self.get_item_summaries_from_search_page(page)
-                if not item_summaries:
-                    logger.warning(f"No items found on page {page}")
-                    break
-                
-                # Process each item
-                for summary in item_summaries:
-                    try:
-                        # Check if driver is still valid before processing each item
-                        if not self.is_driver_valid():
-                            logger.error("WebDriver became invalid while processing items")
-                            break
-                        
-                        # Get detailed information
-                        detailed_info = self.scrape_item_detail_page(summary['url'])
-                        if not detailed_info:
-                            continue
-                        
-                        # Check if the item is valuable based on both analyzers
-                        is_valuable = (
-                            detailed_info['card_analysis']['is_valuable'] and
-                            detailed_info['card_analysis']['confidence_score'] >= 0.6 and
-                            self.rank_analyzer.is_good_condition(
-                                CardCondition(detailed_info['card_analysis']['condition'])
-                            )
-                        )
-                        
-                        if is_valuable:
-                            logger.info(f"Found valuable item: {detailed_info['title']}")
-                            all_items.append(detailed_info)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing item {summary['url']}: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        continue
-                
-                # Check for next page
-                if not self.has_next_page():
-                    break
-                    
-                # Go to next page
-                if not self.go_to_next_page():
-                    break
-                    
-                page += 1
-            
-            # Save results
-            if all_items:
-                self.save_results(all_items, search_term)
-                logger.info(f"Found {len(all_items)} valuable items for {search_term}")
-            else:
-                logger.info(f"No valuable items found for {search_term}")
-            
-            return all_items
-            
-        except Exception as e:
-            logger.error(f"Error during search for {search_term}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return []
 
     def scrape_item_detail_page(self, url):
         """Scrape detailed information from an item's detail page."""
@@ -1265,119 +1282,6 @@ class BuyeeScraper:
             logger.error(f"Error scraping item details: {str(e)}")
             return None
 
-    def get_item_summaries_from_search_page(self, page_number: int = 1) -> List[Dict]:
-        """Extract item summaries from the current search page with improved robustness."""
-        summaries = []
-        
-        # Ensure valid session before proceeding
-        if not self.ensure_valid_session():
-            logger.error("Invalid session, cannot proceed with item summary extraction")
-            return []
-        
-        try:
-            # Wait for page to be fully loaded
-            WebDriverWait(self.driver, self.default_wait_time).until(
-                lambda driver: driver.execute_script('return document.readyState') == 'complete'
-            )
-            
-            # Handle cookie consent
-            self.handle_cookie_consent()
-            
-            # Wait for the main container with multiple selectors
-            container_selectors = [
-                "ul.auctionSearchResult.list_layout",
-                "div.itemList",
-                "div.search-results",
-                "div[data-testid='search-results']"
-            ]
-            
-            main_container = None
-            for selector in container_selectors:
-                try:
-                    main_container = self.wait_for_element(By.CSS_SELECTOR, selector, timeout=self.element_wait_time)
-                    if main_container:
-                        logger.info(f"Found main container with selector: {selector}")
-                        break
-                except Exception as e:
-                    logger.debug(f"Failed to find container with selector {selector}: {str(e)}")
-                    continue
-            
-            if not main_container:
-                logger.error("Could not find main container")
-                self.save_debug_info(
-                    f"search_page_{page_number}",
-                    "no_container",
-                    self.driver.page_source
-                )
-                return []
-            
-            # Try multiple selectors for item cards
-            item_card_selectors = [
-                "li.itemCard",
-                "div[data-testid='item-card']",
-                "div.item-card",
-                "div.search-result-item"
-            ]
-            
-            card_elements = []
-            for selector in item_card_selectors:
-                try:
-                    # Wait for at least one card to be present
-                    first_card = self.wait_for_element(By.CSS_SELECTOR, selector, timeout=self.element_wait_time)
-                    if first_card:
-                        # Then get all cards
-                        card_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                        if card_elements:
-                            logger.info(f"Found {len(card_elements)} cards with selector: {selector}")
-                            break
-                except Exception as e:
-                    logger.debug(f"Failed to find cards with selector {selector}: {str(e)}")
-                    continue
-            
-            if not card_elements:
-                logger.warning("No item cards found")
-                self.save_debug_info(
-                    f"search_page_{page_number}",
-                    "no_cards",
-                    self.driver.page_source
-                )
-                return []
-            
-            # Process each card with robust error handling
-            for i, card in enumerate(card_elements):
-                try:
-                    # Verify card is still attached to DOM
-                    if not self.is_element_attached(card):
-                        logger.warning(f"Card {i+1} is no longer attached to DOM")
-                        continue
-                    
-                    # Extract basic card info
-                    card_info = self.extract_card_info(card, i)
-                    if card_info:
-                        summaries.append(card_info)
-                        logger.info(f"Successfully processed card {i+1}: {card_info.get('title', 'Unknown')}")
-                    
-                except StaleElementReferenceException:
-                    logger.warning(f"Stale element while processing card {i+1}")
-                    continue
-                except Exception as e:
-                    logger.error(f"Error processing card {i+1}: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    continue
-            
-            logger.info(f"Successfully processed {len(summaries)} items from page {page_number}")
-            return summaries
-            
-        except Exception as e:
-            logger.error(f"Error in get_item_summaries_from_search_page: {str(e)}")
-            logger.error(traceback.format_exc())
-            self.save_debug_info(
-                f"search_page_{page_number}",
-                "extraction_error",
-                self.driver.page_source
-            )
-            return summaries
-
     def is_element_attached(self, element: WebElement) -> bool:
         """Check if an element is still attached to the DOM."""
         try:
@@ -1386,162 +1290,6 @@ class BuyeeScraper:
             return True
         except (StaleElementReferenceException, WebDriverException):
             return False
-
-    def extract_card_info(self, card: WebElement, index: int) -> Optional[Dict[str, Any]]:
-        """Extract information from a card element with robust error handling."""
-        try:
-            card_info = {
-                'title': None,
-                'url': None,
-                'price': None,
-                'thumbnail_url': None,
-                'preliminary_analysis': {
-                    'is_valuable': False,
-                    'confidence_score': 0.0,
-                    'condition': CardCondition.UNKNOWN.value,
-                    'rarity': None,
-                    'edition': None,
-                    'set_code': None,
-                    'card_number': None,
-                    'error': None
-                }
-            }
-            
-            # Extract title and URL - prioritize known good selector
-            title_selectors = [
-                "div.itemCard__itemName a",  # Primary selector
-                "h3[data-testid='item-card-title']",
-                "div.item-title a",
-                "a.item-title"
-            ]
-            
-            for selector in title_selectors:
-                try:
-                    title_element = self.wait_for_element(By.CSS_SELECTOR, selector, timeout=5, parent=card)
-                    if title_element:
-                        card_info['title'] = title_element.text.strip()
-                        card_info['url'] = title_element.get_attribute('href')
-                        logger.debug(f"Found title element with selector {selector}: {card_info['title']}")
-                        break
-                except Exception as e:
-                    logger.debug(f"Failed to find title with selector {selector}: {str(e)}")
-                    continue
-            
-            if not card_info['title'] or not card_info['url']:
-                logger.warning(f"Could not extract title/URL for card {index+1}")
-                return None
-            
-            # Extract price - prioritize known good selector
-            price_selectors = [
-                "div.g-priceDetails span.g-price",  # Primary selector
-                "span[data-testid='item-card-price']",
-                "div.item-price",
-                "span.price"
-            ]
-            
-            for selector in price_selectors:
-                try:
-                    price_element = self.wait_for_element(By.CSS_SELECTOR, selector, timeout=5, parent=card)
-                    if price_element:
-                        price_text = price_element.text.strip()
-                        if price_text:
-                            card_info['price'] = self.clean_price(price_text)
-                            logger.debug(f"Found price element with selector {selector}: {card_info['price']}")
-                            break
-                except Exception as e:
-                    logger.debug(f"Failed to find price with selector {selector}: {str(e)}")
-                    continue
-            
-            if not card_info['price']:
-                card_info['price'] = 0.0
-            
-            # Extract thumbnail URL - prioritize known good selector and increase timeout
-            thumbnail_selectors = [
-                "div.itemCard__image img",  # Primary selector
-                "img[data-testid='item-card-image']",
-                "div.item-image img",
-                "img.item-image"
-            ]
-            
-            for selector in thumbnail_selectors:
-                try:
-                    # Use a longer timeout for images since they might be lazy-loaded
-                    img_element = self.wait_for_element(
-                        By.CSS_SELECTOR, 
-                        selector, 
-                        timeout=10,  # Increased timeout for images
-                        condition="visibility",  # Wait for visibility since images might be lazy-loaded
-                        parent=card
-                    )
-                    if img_element:
-                        # Try data-src first (common for lazy-loaded images)
-                        thumbnail_url = img_element.get_attribute('data-src')
-                        if not thumbnail_url:
-                            thumbnail_url = img_element.get_attribute('src')
-                        if thumbnail_url:
-                            card_info['thumbnail_url'] = thumbnail_url
-                            logger.debug(f"Found thumbnail with selector {selector}: {thumbnail_url}")
-                            break
-                except Exception as e:
-                    logger.debug(f"Failed to find thumbnail with selector {selector}: {str(e)}")
-                    continue
-            
-            # Only attempt AI analysis if we have the basic info
-            if card_info['title'] and card_info['url']:
-                try:
-                    # Create item_data dictionary for CardAnalyzer
-                    item_data = {
-                        'title': card_info['title'],
-                        'price': card_info['price'],
-                        'thumbnail_url': card_info['thumbnail_url'],
-                        'url': card_info['url']
-                    }
-                    
-                    # Call analyze_card with the item_data dictionary
-                    preliminary_analysis_result = self.card_analyzer.analyze_card(item_data)
-                    
-                    if preliminary_analysis_result:
-                        try:
-                            # Handle CardInfo object
-                            if hasattr(preliminary_analysis_result, '__dict__'):
-                                # Convert CardInfo object to dictionary
-                                analysis_dict = asdict(preliminary_analysis_result) if hasattr(preliminary_analysis_result, '__dataclass_fields__') else preliminary_analysis_result.__dict__
-                                
-                                # Handle any enum values
-                                if 'condition' in analysis_dict and hasattr(analysis_dict['condition'], 'value'):
-                                    analysis_dict['condition'] = analysis_dict['condition'].value
-                                
-                                card_info['preliminary_analysis'].update(analysis_dict)
-                                logger.info(f"Successfully analyzed card: {card_info['title']}")
-                            # Handle dictionary result
-                            elif isinstance(preliminary_analysis_result, dict):
-                                card_info['preliminary_analysis'].update(preliminary_analysis_result)
-                                logger.info(f"Successfully analyzed card: {card_info['title']}")
-                            else:
-                                error_msg = f"Unexpected analysis result type: {type(preliminary_analysis_result)}"
-                                logger.error(f"{error_msg} for card: {card_info['title']}")
-                                card_info['preliminary_analysis']['error'] = error_msg
-                                
-                        except Exception as analysis_error:
-                            error_msg = f"Error processing analysis result: {str(analysis_error)}"
-                            logger.error(f"{error_msg} for card: {card_info['title']}")
-                            card_info['preliminary_analysis']['error'] = error_msg
-                    else:
-                        logger.warning(f"Card analysis returned None for: {card_info['title']}")
-                        card_info['preliminary_analysis']['error'] = "AI analysis returned None"
-                        
-                except Exception as e:
-                    error_msg = f"AI analysis failed: {str(e)}"
-                    logger.error(f"{error_msg} for card: {card_info['title']}")
-                    logger.error(traceback.format_exc())
-                    card_info['preliminary_analysis']['error'] = error_msg
-            
-            return card_info
-            
-        except Exception as e:
-            logger.error(f"Error extracting card info for card {index+1}: {str(e)}")
-            logger.error(traceback.format_exc())
-            return None
 
     def ensure_valid_session(self) -> bool:
         """Ensure the WebDriver session is valid, reconnecting if necessary."""
@@ -1580,33 +1328,71 @@ class BuyeeScraper:
 
     def wait_for_element(self, by: By, value: str, timeout: int = None, 
                         condition: str = "presence", parent: WebElement = None) -> Optional[WebElement]:
-        """Wait for an element with configurable conditions and timeout."""
+        """Wait for an element with configurable conditions and timeout.
+        
+        Args:
+            by: The locator strategy (e.g., By.CSS_SELECTOR)
+            value: The locator value
+            timeout: Maximum time to wait in seconds
+            condition: The condition to wait for ("presence", "visibility", "clickable")
+            parent: Optional parent element to search within
+            
+        Returns:
+            WebElement if found, None otherwise
+        """
         if timeout is None:
             timeout = self.element_wait_time
             
         try:
             wait = WebDriverWait(self.driver, timeout)
             
+            # Define the expected condition based on the condition parameter
             if condition == "presence":
-                if parent:
-                    return wait.until(EC.presence_of_element_located((by, value)), parent)
-                return wait.until(EC.presence_of_element_located((by, value)))
-            elif condition == "clickable":
-                if parent:
-                    return wait.until(EC.element_to_be_clickable((by, value)), parent)
-                return wait.until(EC.element_to_be_clickable((by, value)))
+                expected_condition = EC.presence_of_element_located((by, value))
             elif condition == "visibility":
-                if parent:
-                    return wait.until(EC.visibility_of_element_located((by, value)), parent)
-                return wait.until(EC.visibility_of_element_located((by, value)))
+                expected_condition = EC.visibility_of_element_located((by, value))
+            elif condition == "clickable":
+                expected_condition = EC.element_to_be_clickable((by, value))
             else:
-                raise ValueError(f"Unsupported condition: {condition}")
+                logger.warning(f"Unknown condition '{condition}', defaulting to presence")
+                expected_condition = EC.presence_of_element_located((by, value))
+            
+            # If parent is provided, use it as the context for finding the element
+            if parent:
+                try:
+                    # First check if parent is still attached to DOM
+                    if not self.is_element_attached(parent):
+                        logger.warning("Parent element is no longer attached to DOM")
+                        return None
+                        
+                    # Wait for element within parent
+                    element = wait.until(
+                        lambda d: parent.find_element(by, value)
+                    )
+                    
+                    # Additional wait for the specific condition
+                    if condition == "visibility":
+                        wait.until(EC.visibility_of(element))
+                    elif condition == "clickable":
+                        wait.until(EC.element_to_be_clickable(element))
+                        
+                    return element
+                    
+                except StaleElementReferenceException:
+                    logger.warning("Parent element became stale while waiting for child element")
+                    return None
+                except Exception as e:
+                    logger.debug(f"Error finding element within parent: {str(e)}")
+                    return None
+            else:
+                # Wait for element in the entire document
+                return wait.until(expected_condition)
                 
         except TimeoutException:
-            logger.warning(f"Timeout waiting for element: {value} (condition: {condition})")
+            logger.debug(f"Timeout waiting for element {value} with condition {condition}")
             return None
         except Exception as e:
-            logger.error(f"Error waiting for element {value}: {str(e)}")
+            logger.debug(f"Error waiting for element {value}: {str(e)}")
             return None
 
     def save_results(self, results: List[Dict[str, Any]], search_term: str) -> None:

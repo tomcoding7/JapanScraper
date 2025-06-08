@@ -3,6 +3,10 @@ import re
 import logging
 from dataclasses import dataclass
 from enum import Enum
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +18,8 @@ class CardCondition(Enum):
     GOOD = "Good"
     LIGHT_PLAYED = "Light Played"
     PLAYED = "Played"
-    POOR = "Poor"
+    HEAVILY_PLAYED = "Heavily Played"
+    DAMAGED = "Damaged"
     UNKNOWN = "Unknown"
 
 @dataclass
@@ -31,9 +36,22 @@ class CardInfo:
     edition: Optional[str]
     region: Optional[str]
     confidence_score: float
+    matched_keywords: List[str] = None
+    ai_analysis: Optional[Dict[str, Any]] = None
+    estimated_value: Optional[Dict[str, float]] = None
+    profit_potential: Optional[float] = None
+    recommendation: Optional[str] = None
 
 class CardAnalyzer:
     def __init__(self):
+        # Load environment variables
+        load_dotenv()
+        
+        # Initialize OpenAI client if API key is available
+        self.openai_client = None
+        if os.getenv('OPENAI_API_KEY'):
+            self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
         # Value indicators for card analysis
         self.value_indicators = {
             'rarity': ['secret', 'ultimate', 'collector', 'gold', 'platinum', 'prismatic'],
@@ -72,9 +90,13 @@ class CardAnalyzer:
                 "played", "p", "played condition",
                 "傷あり", "使用感あり"
             ],
-            CardCondition.POOR: [
-                "poor", "damaged", "heavily played", "hp",
-                "傷みあり", "破損あり", "状態悪い"
+            CardCondition.HEAVILY_PLAYED: [
+                "heavily played", "hp", "heavily played condition",
+                "重度使用", "重度傷あり"
+            ],
+            CardCondition.DAMAGED: [
+                "damaged", "damaged condition",
+                "破損", "損傷", "状態悪い"
             ]
         }
         
@@ -151,48 +173,109 @@ class CardAnalyzer:
             "Korean": ["korean", "韓", "韓国版"]
         }
 
-    def analyze_card(self, item_data: Dict[str, Any]) -> CardInfo:
-        """Analyze a card listing and return detailed information."""
-        title = item_data.get('title', '').lower()
-        price = self._extract_price(item_data.get('price', '0'))
+    def analyze_card(self, item_data: Dict[str, Any], rank_analysis_results: Optional[Dict] = None, llm_analysis: Optional[Dict] = None) -> CardInfo:
+        """
+        Analyze a card listing using both rule-based and AI analysis.
         
-        # Extract condition
-        condition = self._determine_condition(title)
-        
-        # Extract rarity
-        rarity = self._determine_rarity(title)
-        
-        # Extract set code and card number
-        set_code, card_number = self._extract_set_info(title)
-        
-        # Extract edition
-        edition = self._determine_edition(title)
-        
-        # Extract region
-        region = self._determine_region(title)
-        
-        # Check if card is valuable
-        is_valuable = self._is_valuable_card(title, set_code)
-        
-        # Calculate confidence score
-        confidence_score = self._calculate_confidence_score(
-            condition, rarity, set_code, card_number, edition, region
-        )
-        
-        return CardInfo(
-            title=item_data.get('title', ''),
-            price=price,
-            url=item_data.get('url', ''),
-            image_url=item_data.get('image_url'),
-            condition=condition,
-            is_valuable=is_valuable,
-            rarity=rarity,
-            set_code=set_code,
-            card_number=card_number,
-            edition=edition,
-            region=region,
-            confidence_score=confidence_score
-        )
+        Args:
+            item_data: Dictionary containing card information (title, description, price, etc.)
+            rank_analysis_results: Optional results from RankAnalyzer
+            llm_analysis: Optional results from previous LLM analysis
+            
+        Returns:
+            CardInfo object with analysis results
+        """
+        try:
+            title = item_data.get('title', '')
+            description = item_data.get('description', '')
+            price = self._extract_price(item_data.get('price', '0'))
+            url = item_data.get('url', '')
+            image_url = item_data.get('image_url')
+            
+            # Initialize CardInfo with basic information
+            card_info = CardInfo(
+                title=title,
+                price=price,
+                url=url,
+                image_url=image_url,
+                condition=CardCondition.UNKNOWN,
+                is_valuable=False,
+                rarity=None,
+                set_code=None,
+                card_number=None,
+                edition=None,
+                region=None,
+                confidence_score=0.0,
+                matched_keywords=[],
+                ai_analysis={},
+                estimated_value={'min': 0.0, 'max': 0.0},
+                profit_potential=0.0,
+                recommendation=""
+            )
+            
+            # 1. Basic Text Analysis
+            title_lower = title.lower()
+            description_lower = description.lower() if description else ""
+            
+            # Extract condition
+            card_info.condition = self._determine_condition(title_lower + " " + description_lower)
+            
+            # Extract rarity
+            card_info.rarity = self._determine_rarity(title_lower + " " + description_lower)
+            
+            # Extract set code and card number
+            card_info.set_code, card_info.card_number = self._extract_set_info(title_lower + " " + description_lower)
+            
+            # Extract edition
+            card_info.edition = self._determine_edition(title_lower + " " + description_lower)
+            
+            # Extract region
+            card_info.region = self._determine_region(title_lower + " " + description_lower)
+            
+            # Check if card is valuable
+            card_info.is_valuable = self._is_valuable_card(title_lower, card_info.set_code)
+            
+            # 2. AI Analysis (if OpenAI client is available)
+            if self.openai_client:
+                try:
+                    ai_analysis = self._perform_ai_analysis(title, description, price)
+                    card_info.ai_analysis = ai_analysis
+                    
+                    # Update card info based on AI analysis
+                    if 'value_assessment' in ai_analysis:
+                        card_info.estimated_value = {
+                            'min': ai_analysis['value_assessment']['min_value'],
+                            'max': ai_analysis['value_assessment']['max_value']
+                        }
+                    
+                    if 'profit_potential' in ai_analysis:
+                        card_info.profit_potential = ai_analysis['profit_potential']['estimated_profit']
+                    
+                    if 'recommendation' in ai_analysis:
+                        card_info.recommendation = f"{ai_analysis['recommendation']['action']}: {ai_analysis['recommendation']['reasoning']}"
+                    
+                    # Update confidence score
+                    if 'value_assessment' in ai_analysis and 'confidence' in ai_analysis['value_assessment']:
+                        card_info.confidence_score = ai_analysis['value_assessment']['confidence']
+                    
+                except Exception as e:
+                    logger.error(f"Error in AI analysis: {str(e)}")
+            
+            # Calculate final confidence score
+            card_info.confidence_score = self._calculate_confidence_score(
+                card_info.condition,
+                card_info.rarity,
+                card_info.set_code,
+                card_info.card_number,
+                card_info.edition,
+                card_info.region
+            )
+            
+            return card_info
+            
+        except Exception as e:
+            logger.error(f"Error analyzing card: {str(e)}")
+            raise
 
     def _extract_price(self, price_text: str) -> float:
         """Extract numeric price from text."""
@@ -203,38 +286,38 @@ class CardAnalyzer:
         except (ValueError, TypeError):
             return 0.0
 
-    def _determine_condition(self, title: str) -> CardCondition:
-        """Determine card condition from title."""
+    def _determine_condition(self, text: str) -> CardCondition:
+        """Determine card condition from text."""
         for condition, keywords in self.condition_keywords.items():
-            if any(keyword.lower() in title.lower() for keyword in keywords):
+            if any(keyword.lower() in text.lower() for keyword in keywords):
                 return condition
         return CardCondition.UNKNOWN
 
-    def _determine_rarity(self, title: str) -> Optional[str]:
-        """Determine card rarity from title."""
+    def _determine_rarity(self, text: str) -> Optional[str]:
+        """Determine card rarity from text."""
         for rarity, keywords in self.rarity_keywords.items():
-            if any(keyword.lower() in title.lower() for keyword in keywords):
+            if any(keyword.lower() in text.lower() for keyword in keywords):
                 return rarity
         return None
 
-    def _extract_set_info(self, title: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract set code and card number from title."""
-        match = self.set_code_pattern.search(title)
+    def _extract_set_info(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract set code and card number from text."""
+        match = self.set_code_pattern.search(text)
         if match:
             return match.group(1), match.group(3)
         return None, None
 
-    def _determine_edition(self, title: str) -> Optional[str]:
-        """Determine card edition from title."""
+    def _determine_edition(self, text: str) -> Optional[str]:
+        """Determine card edition from text."""
         for edition, keywords in self.edition_keywords.items():
-            if any(keyword.lower() in title.lower() for keyword in keywords):
+            if any(keyword.lower() in text.lower() for keyword in keywords):
                 return edition
         return None
 
-    def _determine_region(self, title: str) -> Optional[str]:
-        """Determine card region from title."""
+    def _determine_region(self, text: str) -> Optional[str]:
+        """Determine card region from text."""
         for region, keywords in self.region_keywords.items():
-            if any(keyword.lower() in title.lower() for keyword in keywords):
+            if any(keyword.lower() in text.lower() for keyword in keywords):
                 return region
         return None
 
@@ -248,7 +331,7 @@ class CardAnalyzer:
         # Check against known valuable cards
         for card_name, valid_sets in self.valuable_cards.items():
             if card_name.lower() in title_lower:
-                if set_code is None or set_code in valid_sets:
+                if not set_code or set_code in valid_sets:
                     logger.debug(f"Card matched valuable card list: {card_name}")
                     return True
         
@@ -285,27 +368,107 @@ class CardAnalyzer:
     def _calculate_confidence_score(self, condition: CardCondition, rarity: Optional[str],
                                   set_code: Optional[str], card_number: Optional[str],
                                   edition: Optional[str], region: Optional[str]) -> float:
-        """Calculate confidence score for the card analysis."""
+        """Calculate confidence score based on available information."""
         score = 0.0
+        total_factors = 0
         
-        # Condition score
+        # Condition confidence
         if condition != CardCondition.UNKNOWN:
-            score += 0.3
+            score += 1.0
+        total_factors += 1
         
-        # Rarity score
+        # Rarity confidence
         if rarity:
-            score += 0.2
+            score += 1.0
+        total_factors += 1
         
-        # Set code and card number score
-        if set_code and card_number:
-            score += 0.2
+        # Set code confidence
+        if set_code:
+            score += 1.0
+        total_factors += 1
         
-        # Edition score
+        # Card number confidence
+        if card_number:
+            score += 1.0
+        total_factors += 1
+        
+        # Edition confidence
         if edition:
-            score += 0.15
+            score += 1.0
+        total_factors += 1
         
-        # Region score
+        # Region confidence
         if region:
-            score += 0.15
+            score += 1.0
+        total_factors += 1
         
-        return score 
+        return score / total_factors if total_factors > 0 else 0.0
+
+    def _perform_ai_analysis(self, title: str, description: str, price: float) -> Dict[str, Any]:
+        """Perform AI analysis using OpenAI API."""
+        if not self.openai_client:
+            return {}
+        
+        try:
+            # Prepare analysis prompt
+            analysis_prompt = f"""
+            Analyze this Yu-Gi-Oh! card listing:
+            Title: {title}
+            Description: {description}
+            Current Price: ¥{price}
+            
+            Please provide a detailed analysis including:
+            1. Card identification (name, set, number if visible)
+            2. Condition assessment
+            3. Authenticity check
+            4. Value assessment based on recent eBay sales
+            5. Profit potential analysis
+            6. Recommendation (Buy/Pass)
+            
+            Format your response as JSON with these keys:
+            {{
+                "card_name": "string",
+                "set_code": "string",
+                "card_number": "string",
+                "condition": "string",
+                "authenticity": "string",
+                "value_assessment": {{
+                    "min_value": float,
+                    "max_value": float,
+                    "confidence": float
+                }},
+                "profit_potential": {{
+                    "estimated_profit": float,
+                    "risk_level": "string",
+                    "confidence": float
+                }},
+                "recommendation": {{
+                    "action": "string",
+                    "reasoning": "string",
+                    "confidence": float
+                }}
+            }}
+            """
+            
+            # Call OpenAI API
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert Yu-Gi-Oh! card evaluator with deep knowledge of card values, conditions, and market trends."
+                    },
+                    {
+                        "role": "user",
+                        "content": analysis_prompt
+                    }
+                ],
+                response_format={"type": "json_object"}
+            )
+            
+            # Parse AI response
+            return json.loads(response.choices[0].message.content)
+            
+        except Exception as e:
+            logger.error(f"Error in AI analysis: {str(e)}")
+            return {} 
